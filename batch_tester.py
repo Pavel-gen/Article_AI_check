@@ -16,7 +16,9 @@ from datetime import datetime
 from test_data import citations
 
 # --- Конфигурация ---
-API_URL = "https://api.openalex.org/works"
+API_URL_CROSS_REF = "https://api.crossref.org/works"
+API_URL_OPENALEX = "https://api.openalex.org/works"
+
 HEADERS = {"User-Agent": "CitationTester/1.0"}
 DELAY_SEC = 1.0  # Пауза между запросами (вежливость к API)
 
@@ -80,7 +82,7 @@ def check_citation(citation: dict) -> dict:
     }
     
     try:
-        resp = requests.get(API_URL, params={"search": query, "per_page": 3}, headers=HEADERS, timeout=15)
+        resp = requests.get(API_URL_OPENALEX, params={"search": query, "per_page": 3}, headers=HEADERS, timeout=15)
         result["response_time_ms"] = round((time.time() - start) * 1000)
         resp.raise_for_status()
         papers = resp.json().get('results', [])
@@ -101,20 +103,133 @@ def check_citation(citation: dict) -> dict:
             if year_match and author_match:
                 result["status"] = "FOUND"
                 result["found_title"] = paper.get('title')
-                result["abstract"] = restore_abstract(paper.get('abstract_inverted_index'))[:500]
+
+
                 result["doi"] = paper.get('doi')
                 result["journal"] = (paper.get('host_venue') or {}).get('display_name')
+
+                abstract = restore_abstract(paper.get('abstract_inverted_index'))
+                
+                if not abstract and result["doi"]:
+                    print(f" Нет абстракта, работаем по OpenALEX DOI...")
+                    abstract_by_doi = fetch_abstract_openalex_doi(result["doi"])
+                    if abstract_by_doi:
+                        print(f"Абстракт был найден по DOI в OpenAlex:")
+                        abstract = abstract_by_doi
+                        break
+                    
+                    print(f" Нет абстракта, работаем по CrossRef DOI...")
+                    abstract_by_doi = fetch_anstract_crossref_doi(result["doi"])
+                    if abstract_by_doi:
+                        print(f"Абстракт был найден в Crossref")
+                        abstract = abstract_by_doi
+
+
+
+
+                result["abstract"] = abstract
+
                 return result
         
         # Не точное совпадение
-        result["status"] = "CLOSE_MATCH"
-        result["found_title"] = papers[0].get('title')
-        result["note"] = f"year={papers[0].get('publication_year')}, author_match={any(expected_author.lower() in a.lower() for a in [x['author'].get('display_name','') for x in papers[0].get('authorships',[])])}"
+        result = search_crossref(query, expected_year, expected_author)
+
+        # result["found_title"] = papers[0].get('title')
+        # result["note"] = f"year={papers[0].get('publication_year')}, author_match={any(expected_author.lower() in a.lower() for a in [x['author'].get('display_name','') for x in papers[0].get('authorships',[])])}"
         
     except requests.exceptions.RequestException as e:
         result["error"] = str(e)
     
     return result
+
+
+def search_crossref(title, year, author):
+    responce = requests.get(API_URL_CROSS_REF, params={ "query.title": title, "rows": 3}, headers=HEADERS, timeout=15)
+    items = responce.json().get('message', {}).get('items', [])
+    print('ORIGINAL INFO: ')
+    print(title, author, year)
+    print("*"*85)
+    print("Вызов CROSSREF")
+    for item in items:
+        found_title = item.get('title', [''])[0]
+        found_doi = item.get("DOI")
+
+        date_parts = item.get('published-print', {}).get('date-parts', [[0]])
+        found_year = date_parts[0][0] if date_parts and date_parts[0] else None
+
+        authors = item.get('author', [])
+        found_author = authors[0].get('family', '') if authors else ''
+
+        year_match = (found_year and year and abs(found_year - year) <= 1)
+        author_match = (author and found_author and author.lower() in found_author.lower())
+
+        if year_match and author_match:
+            print('CROSS_REF_INFO:', found_doi)
+
+            abstract = item.get('abstract')
+            if found_doi:
+                abstract = fetch_abstract_openalex_doi(found_doi)
+
+            return {
+                "status": "FOUND VIA CROSSREF", 
+                "found_title": found_title,
+                "doi": found_doi,
+                "year": found_year,
+                "author": found_author,
+                "abstract": abstract,
+            }
+    return {"status": "NOT FOUND"}
+
+def fetch_abstract_openalex_doi(doi):
+    
+    if not doi:
+        return None
+    
+    try:
+        resp = requests.get(
+            API_URL_OPENALEX,
+            params={"filter": f"doi:{doi}", "per_page": 1},
+            headers=HEADERS,
+            timeout=10
+        )
+
+        data = resp.json()
+        results = data.get('results', [])
+
+        if results:
+            inverted = results[0].get('abstract_inverted_index')
+            if inverted and isinstance(inverted, dict):
+                sorted_words = sorted(inverted.items(), key = lambda x: min(x[1]) if isinstance(x[1], list) else x[1])
+                return ' '.join([word for word, _ in sorted_words])
+    except:
+        pass
+    
+    return None
+
+def fetch_anstract_crossref_doi(doi):
+
+    if not doi:
+        return None
+    
+    try: 
+        resp = requests.get(
+            API_URL_CROSS_REF + '/{doi}',
+            headers=HEADERS,
+            timeout=10
+        )
+
+        if resp.status_code != 200:
+            return None
+    
+        data = resp.json()
+        abstract = data.get('message', {}).get('abstract')
+
+        if abstract:
+            return abstract
+    except: 
+        pass
+
+    return None
 
 def run_test(citations_list: list, max_items: int = None):
     """
@@ -129,7 +244,9 @@ def run_test(citations_list: list, max_items: int = None):
         "total_citations": total,
         "found": 0,
         "not_found": 0,
+        "cross_found": 0,
         "close_match": 0,
+        "abstract_full": 0,
         "errors": 0,
         "results": [],
         "timing": {}
@@ -157,10 +274,18 @@ def run_test(citations_list: list, max_items: int = None):
         elif status == 'NOT_FOUND':
             stats["not_found"] += 1
             print(f"   ❌ NOT_FOUND")
+        elif status == 'FOUND VIA CROSSREF':
+            stats["cross_found"] += 1
+            print(f"   FOUND VIA CROSSREF")
         else:
             stats["errors"] += 1
             print(f"   ⛔ ERROR: {res.get('error', 'unknown')}")
         
+        abstract = res.get('abstract')
+
+        if (abstract and len(abstract) > 0):
+            stats["abstract_full"] += 1
+
         # Пауза (кроме последнего запроса)
         if i < total:
             time.sleep(DELAY_SEC)
@@ -185,9 +310,12 @@ def print_summary(stats: dict):
     print("🏁"*40)
     print(f"📦 Всего цитат:     {stats['total_citations']}")
     print(f"✅ Найдено точно:   {stats['found']} ({stats['hit_rate_percent']}%)")
+    print(f"Найдено через CROSSREF:   {stats['cross_found']}")
+    print(f"Найдено abstract:   {stats['abstract_full']}")
     print(f"⚠️  Близкие совпадения: {stats['close_match']}")
     print(f"❌ Не найдено:      {stats['not_found']}")
     print(f"⛔ Ошибки:          {stats['errors']}")
+
     print(f"\n⏱️  Время выполнения: {t['total_seconds']}с")
     print(f"📈 Скорость:        {t['requests_per_minute']} запросов/мин")
     print(f"⚡ Среднее время:   {t['avg_per_request_ms']}мс/запрос")
@@ -196,9 +324,9 @@ def print_summary(stats: dict):
 def save_report(stats: dict, filename: str = "results.json"):
     """Сохраняет отчёт в JSON (без дублирования больших абстрактов)"""
     # Для отчёта можно обрезать абстракты до 200 символов
-    for r in stats["results"]:
-        if r.get("check_result", {}).get("abstract") and len(r["check_result"]["abstract"]) > 200:
-            r["check_result"]["abstract"] = r["check_result"]["abstract"][:200] + "..."
+    # for r in stats["results"]:
+    #     if r.get("check_result", {}).get("abstract") and len(r["check_result"]["abstract"]) > 200:
+    #         r["check_result"]["abstract"] = r["check_result"]["abstract"][:200] + "..."
     
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
@@ -216,12 +344,3 @@ if __name__ == "__main__":
     # Вывод и сохранение
     print_summary(stats)
     save_report(stats)
-    
-    # 💡 Совет для презентации:
-    if stats["hit_rate_percent"] >= 70:
-        print(f"\n🎯 Система готова к демо! Попадание {stats['hit_rate_percent']}% — отличный результат.")
-    else:
-        print(f"\n⚠️ Попадание {stats['hit_rate_percent']}%. Для демо можно:")
-        print("   1. Убрать из списка заведомо старые/редкие статьи")
-        print("   2. Улучшить build_query() — брать больше ключевых слов")
-        print("   3. Добавить второй источник (Crossref) для подстраховки")
